@@ -10,6 +10,7 @@ from torch.distributions import Categorical
 from .audio import CHUNK_LENGTH
 from .tokenizer import Tokenizer, get_tokenizer
 from .utils import compression_ratio
+from cuda_beam_search.cuda_beam_search.beam_search_cuda import cuda_update
 
 if TYPE_CHECKING:
     from .model import Whisper
@@ -112,6 +113,7 @@ class DecodingOptions:
 
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
+    beam_search_device: str = "CPU"  # 'CPU' or 'GPU', controls which beam search decoder to use
 
 
 @dataclass(frozen=True)
@@ -324,7 +326,7 @@ class BeamSearchDecoder(TokenDecoder):
         self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor
     ) -> Tuple[Tensor, bool]:
         if tokens.shape[0] % self.beam_size != 0:
-            raise ValueError(f"{tokens.shape}[0] % {self.beam_size} != 0")
+            raise ValueError(f"{tokens.shape[0]} % {self.beam_size} != 0")
 
         n_audio = tokens.shape[0] // self.beam_size
         if self.finished_sequences is None:  # for the first update
@@ -505,6 +507,103 @@ class ApplyTimestampRules(LogitFilter):
                 logits[k, : self.tokenizer.timestamp_begin] = -np.inf
 
 
+class BeamSearchDecoderGPU(TokenDecoder):
+    def __init__(
+        self,
+        beam_size: int,
+        eot: int,
+        inference: Inference,
+        patience: Optional[float] = None,
+    ):
+        self.beam_size = beam_size
+        self.eot = eot
+        self.inference = inference
+        self.patience = patience or 1.0
+        self.max_candidates: int = round(beam_size * self.patience)
+        self.finished_sequences = None
+
+        assert (
+            self.max_candidates > 0
+        ), f"Invalid beam size ({beam_size}) or patience ({patience})"
+
+    def reset(self):
+        self.finished_sequences = None
+
+    def update(
+        self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor
+    ) -> Tuple[Tensor, bool]:
+        if tokens.shape[0] % self.beam_size != 0:
+            raise ValueError(f"{tokens.shape[0]} % {self.beam_size} != 0")
+
+        n_audio = tokens.shape[0] // self.beam_size
+        if self.finished_sequences is None:  # for the first update
+            self.finished_sequences = [{} for _ in range(n_audio)]
+
+
+        out_tokens, out_sum_logprobs, out_source_indices, out_finished = cuda_update(
+            tokens.to(torch.int32),
+            torch.nn.functional.log_softmax(logits.float(), dim=-1),
+            sum_logprobs.float(),
+            self.beam_size,
+            self.eot
+        )
+        next_tokens = out_tokens
+        sum_logprobs = out_sum_logprobs
+        source_indices = out_source_indices.tolist()
+        finished_sequences = []
+        for i in range(n_audio):
+            finished = {}
+            base = i * self.beam_size
+            for j in range(self.beam_size):
+                idx = base + j
+                seq = tuple(next_tokens[idx].tolist())
+                if out_finished[idx].item() == 1:
+                    finished[seq] = sum_logprobs[idx].item()
+            finished_sequences.append(finished)
+
+        tokens = next_tokens
+        self.inference.rearrange_kv_cache(source_indices)
+
+        # add newly finished sequences to self.finished_sequences
+        assert len(self.finished_sequences) == len(finished_sequences)
+        for previously_finished, newly_finished in zip(
+            self.finished_sequences, finished_sequences
+        ):
+            for seq in sorted(newly_finished, key=newly_finished.get, reverse=True):
+                if len(previously_finished) >= self.max_candidates:
+                    break  # the candidate list is full
+                previously_finished[seq] = newly_finished[seq]
+
+        # mark as completed if all audio has enough number of samples
+        completed = all(
+            len(sequences) >= self.max_candidates
+            for sequences in self.finished_sequences
+        )
+        return tokens, completed
+
+    def finalize(self, preceding_tokens: Tensor, sum_logprobs: Tensor):
+        # collect all finished sequences, including patience, and add unfinished ones if not enough
+        sum_logprobs = sum_logprobs.cpu()
+        for i, sequences in enumerate(self.finished_sequences):
+            if (
+                len(sequences) < self.beam_size
+            ):  # when not enough sequences are finished
+                for j in list(np.argsort(sum_logprobs[i]))[::-1]:
+                    sequence = preceding_tokens[i, j].tolist() + [self.eot]
+                    sequences[tuple(sequence)] = sum_logprobs[i][j].item()
+                    if len(sequences) >= self.beam_size:
+                        break
+
+        tokens: List[List[Tensor]] = [
+            [torch.tensor(seq) for seq in sequences.keys()]
+            for sequences in self.finished_sequences
+        ]
+        sum_logprobs: List[List[float]] = [
+            list(sequences.values()) for sequences in self.finished_sequences
+        ]
+        return tokens, sum_logprobs
+
+
 class DecodingTask:
     inference: Inference
     sequence_ranker: SequenceRanker
@@ -544,9 +643,14 @@ class DecodingTask:
 
         # decoder: implements how to select the next tokens, given the autoregressive distribution
         if options.beam_size is not None:
-            self.decoder = BeamSearchDecoder(
-                options.beam_size, tokenizer.eot, self.inference, options.patience
-            )
+            if getattr(options, 'beam_search_device', 'CPU') == 'GPU':
+                self.decoder = BeamSearchDecoderGPU(
+                    options.beam_size, tokenizer.eot, self.inference, options.patience
+                )
+            else:
+                self.decoder = BeamSearchDecoder(
+                    options.beam_size, tokenizer.eot, self.inference, options.patience
+                )
         else:
             self.decoder = GreedyDecoder(options.temperature, tokenizer.eot)
 
