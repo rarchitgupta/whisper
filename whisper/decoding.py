@@ -11,6 +11,9 @@ from .audio import CHUNK_LENGTH
 from .tokenizer import Tokenizer, get_tokenizer
 from .utils import compression_ratio
 from cuda_beam_search.cuda_beam_search.beam_search_cuda import cuda_update
+from cuda_beam_search.cuda_beam_search.topk_beam_expansion_cuda import cuda_topk_beam_expansion
+from cuda_beam_search.cuda_beam_search.logit_filter_cuda import cuda_logit_filter
+import time
 
 if TYPE_CHECKING:
     from .model import Whisper
@@ -539,14 +542,21 @@ class BeamSearchDecoderGPU(TokenDecoder):
         if self.finished_sequences is None:  # for the first update
             self.finished_sequences = [{} for _ in range(n_audio)]
 
+        # Ensure all tensors are on the same device (GPU)
+        device = logits.device
+        tokens = tokens.to(torch.int32).to(device)
+        logits = torch.nn.functional.log_softmax(logits.float(), dim=-1).to(device)
+        sum_logprobs = sum_logprobs.float().to(device)
 
-        out_tokens, out_sum_logprobs, out_source_indices, out_finished = cuda_update(
-            tokens.to(torch.int32),
-            torch.nn.functional.log_softmax(logits.float(), dim=-1),
-            sum_logprobs.float(),
+        out_tokens, out_sum_logprobs, out_source_indices, out_finished = cuda_topk_beam_expansion(
+            tokens,
+            logits,
+            sum_logprobs,
             self.beam_size,
             self.eot
         )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         next_tokens = out_tokens
         sum_logprobs = out_sum_logprobs
         source_indices = out_source_indices.tolist()
@@ -560,11 +570,8 @@ class BeamSearchDecoderGPU(TokenDecoder):
                 if out_finished[idx].item() == 1:
                     finished[seq] = sum_logprobs[idx].item()
             finished_sequences.append(finished)
-
         tokens = next_tokens
         self.inference.rearrange_kv_cache(source_indices)
-
-        # add newly finished sequences to self.finished_sequences
         assert len(self.finished_sequences) == len(finished_sequences)
         for previously_finished, newly_finished in zip(
             self.finished_sequences, finished_sequences
@@ -573,8 +580,6 @@ class BeamSearchDecoderGPU(TokenDecoder):
                 if len(previously_finished) >= self.max_candidates:
                     break  # the candidate list is full
                 previously_finished[seq] = newly_finished[seq]
-
-        # mark as completed if all audio has enough number of samples
         completed = all(
             len(sequences) >= self.max_candidates
             for sequences in self.finished_sequences
@@ -656,10 +661,14 @@ class DecodingTask:
 
         # logit filters: applies various rules to suppress or penalize certain tokens
         self.logit_filters = []
+        self._suppress_tokens_gpu = None
         if self.options.suppress_blank:
             self.logit_filters.append(SuppressBlank(self.tokenizer, self.sample_begin))
         if self.options.suppress_tokens:
-            self.logit_filters.append(SuppressTokens(self._get_suppress_tokens()))
+            if getattr(options, 'beam_search_device', 'CPU') == 'GPU':
+                self._suppress_tokens_gpu = torch.tensor(self._get_suppress_tokens(), dtype=torch.int32)
+            else:
+                self.logit_filters.append(SuppressTokens(self._get_suppress_tokens()))
         if not options.without_timestamps:
             precision = CHUNK_LENGTH / model.dims.n_audio_ctx  # usually 0.02 seconds
             max_initial_timestamp_index = None
@@ -789,6 +798,8 @@ class DecodingTask:
         try:
             for i in range(self.sample_len):
                 logits = self.inference.logits(tokens, audio_features)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
                 if (
                     i == 0 and self.tokenizer.no_speech is not None
@@ -801,10 +812,19 @@ class DecodingTask:
 
                 # apply the logit filters, e.g. for suppressing or applying penalty to
                 for logit_filter in self.logit_filters:
+                    if (
+                        isinstance(logit_filter, SuppressTokens)
+                        and self._suppress_tokens_gpu is not None
+                    ):
+                        cuda_logit_filter(logits, self._suppress_tokens_gpu)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        continue
                     logit_filter.apply(logits, tokens)
 
-                # expand the tokens tensor with the selected next tokens
                 tokens, completed = self.decoder.update(tokens, logits, sum_logprobs)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
                 if completed or tokens.shape[-1] > self.n_ctx:
                     break
